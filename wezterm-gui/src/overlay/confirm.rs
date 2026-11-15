@@ -5,7 +5,7 @@ use mux_lua::MuxPane;
 use std::rc::Rc;
 use termwiz::cell::AttributeChange;
 use termwiz::color::ColorAttribute;
-use termwiz::input::{InputEvent, KeyCode, KeyEvent, MouseButtons, MouseEvent};
+use termwiz::input::{InputEvent, KeyCode, KeyEvent, Modifiers, MouseButtons, MouseEvent};
 use termwiz::surface::{Change, CursorVisibility, Position};
 use termwiz::terminal::Terminal;
 
@@ -35,7 +35,7 @@ fn run_confirmation_impl(message: &str, term: &mut TermWizTerminal) -> anyhow::R
     let mut active = ActiveButton::None;
 
     let yes_x = x_pos;
-    let yes_w = 7;
+    let yes_w = 9; // " [Y/Z]es "
 
     let no_x =  yes_x + yes_w + 8 /* spacer */;
     let no_w = 6;
@@ -70,7 +70,7 @@ fn run_confirmation_impl(message: &str, term: &mut TermWizTerminal) -> anyhow::R
         if active == ActiveButton::Yes {
             changes.push(AttributeChange::Reverse(true).into());
         }
-        changes.push(" [Y]es ".into());
+        changes.push(" [Y/Z]es ".into());
         if active == ActiveButton::Yes {
             changes.push(AttributeChange::Reverse(false).into());
         }
@@ -94,9 +94,13 @@ fn run_confirmation_impl(message: &str, term: &mut TermWizTerminal) -> anyhow::R
     while let Ok(Some(event)) = term.poll_input(None) {
         match event {
             InputEvent::Key(KeyEvent {
-                key: KeyCode::Char('y' | 'Y'),
-                ..
-            }) => {
+                // 'z' as well: on a QWERTZ keyboard it sits where 'y' is on
+                // a QWERTY one, so muscle memory works with either layout
+                key: KeyCode::Char('y' | 'Y' | 'z' | 'Z'),
+                modifiers,
+            }) if !modifiers.intersects(Modifiers::CTRL | Modifiers::ALT | Modifiers::SUPER) => {
+                // Only a plain key confirms: Ctrl+Z is a reflex "undo" and
+                // must not kill anything
                 return Ok(true);
             }
             InputEvent::Key(KeyEvent {
