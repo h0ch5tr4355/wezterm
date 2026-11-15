@@ -112,11 +112,14 @@ lazy_static! {
         unsafe { RegisterWindowMessageW(wide_string("TaskbarButtonCreated").as_ptr()) };
 }
 
+/// Not defined by winapi; see ChangeWindowMessageFilterEx
+const MSGFLT_ALLOW: DWORD = 1;
+
 thread_local! {
     /// Shared by all windows; only ever used from the gui thread.
     static TASKBAR_LIST: Option<ITaskbarList3> = unsafe {
-        // If COM is already initialized on this thread, this fails with
-        // S_FALSE or RPC_E_CHANGED_MODE, which is fine.
+        // If COM is already initialized on this thread, this returns
+        // S_FALSE (a success code) or RPC_E_CHANGED_MODE; either is fine.
         let _ = CoInitializeEx(null(), COINIT_APARTMENTTHREADED);
         match CoCreateInstance::<_, ITaskbarList3>(&TaskbarList, None, CLSCTX_INPROC_SERVER)
             .and_then(|list| list.HrInit().map(|_| list))
@@ -593,6 +596,19 @@ impl Window {
         if hwnd.is_null() {
             let err = IoError::last_os_error();
             bail!("CreateWindowExW: {}", err);
+        }
+
+        // When running elevated, the message from the unelevated Explorer
+        // is filtered out unless we let it through
+        if *TASKBAR_BUTTON_CREATED != 0 {
+            unsafe {
+                ChangeWindowMessageFilterEx(
+                    hwnd,
+                    *TASKBAR_BUTTON_CREATED,
+                    MSGFLT_ALLOW,
+                    null_mut(),
+                );
+            }
         }
 
         // We have to re-apply the styles otherwise they don't
