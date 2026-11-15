@@ -202,7 +202,8 @@ fn adjust_client_to_window_dimensions(
 /// two dpis forever and stops responding.
 ///
 /// Returns the position that keeps a window of the given outer size on the
-/// monitor it is on now, or None if no move is needed.
+/// monitor it is on now, or None if no move is needed. Monitors with the same
+/// dpi cannot cause that loop, so the window may grow onto those freely.
 unsafe fn origin_keeping_monitor(hwnd: HWND, width: i32, height: i32) -> Option<(i32, i32)> {
     let mut rect: RECT = std::mem::zeroed();
     if GetWindowRect(hwnd, &mut rect) == 0 {
@@ -216,7 +217,11 @@ unsafe fn origin_keeping_monitor(hwnd: HWND, width: i32, height: i32) -> Option<
     };
 
     let current = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
-    if current.is_null() || MonitorFromRect(&resized, MONITOR_DEFAULTTONEAREST) == current {
+    let target = MonitorFromRect(&resized, MONITOR_DEFAULTTONEAREST);
+    if current.is_null() || target.is_null() || target == current {
+        return None;
+    }
+    if monitor_dpi(current) == monitor_dpi(target) {
         return None;
     }
 
@@ -231,6 +236,13 @@ unsafe fn origin_keeping_monitor(hwnd: HWND, width: i32, height: i32) -> Option<
     } else {
         Some(origin)
     }
+}
+
+unsafe fn monitor_dpi(monitor: HMONITOR) -> u32 {
+    let mut dpi_x = USER_DEFAULT_SCREEN_DPI as u32;
+    let mut dpi_y = USER_DEFAULT_SCREEN_DPI as u32;
+    GetDpiForMonitor(monitor, MDT_EFFECTIVE_DPI, &mut dpi_x, &mut dpi_y);
+    dpi_x
 }
 
 /// Shift `rect` so that it lies within `work`, without resizing it.
@@ -1030,7 +1042,6 @@ impl WindowOps for Window {
         Connection::with_window_inner(self.0, move |inner| {
             let hwnd = inner.hwnd;
             let decorations = inner.config.window_decorations;
-            let in_size_move = inner.in_size_move;
             promise::spawn::spawn(async move {
                 log::trace!("set_inner_size called with {width}x{height}");
                 let frame_dpi = unsafe { GetDpiForWindow(hwnd.0) };
@@ -1043,7 +1054,11 @@ impl WindowOps for Window {
                 let window_state = get_window_state(hwnd.0);
                 if window_state.can_resize() {
                     // While the user drags the window, the move loop owns
-                    // its position.
+                    // its position. Read the flag now rather than when the
+                    // resize was requested: the drag may have ended since.
+                    let in_size_move = rc_from_hwnd(hwnd.0)
+                        .map(|inner| inner.borrow().in_size_move)
+                        .unwrap_or(false);
                     let origin = if in_size_move {
                         None
                     } else {
