@@ -2029,9 +2029,11 @@ impl TermWindow {
                 }),
         );
         if taskbar_progress != self.taskbar_progress {
-            self.taskbar_progress = taskbar_progress;
+            // Only remember what actually reached the window, so that an
+            // update arriving before the window exists is not lost
             if let Some(window) = self.window.as_ref() {
                 window.set_taskbar_progress(taskbar_progress);
+                self.taskbar_progress = taskbar_progress;
             }
         }
 
