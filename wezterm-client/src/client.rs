@@ -463,14 +463,7 @@ pub fn unix_connect_with_retry(
                 let mut cmd = std::process::Command::new(&argv[0]);
                 cmd.args(&argv[1..]);
 
-                let (a, b) = filedescriptor::socketpair()?;
-
-                cmd.stdin(b.as_stdio()?);
-                cmd.stdout(b.as_stdio()?);
-                cmd.stderr(std::process::Stdio::inherit());
-                let mut child = cmd
-                    .spawn()
-                    .with_context(|| format!("spawning proxy command {:?}", cmd))?;
+                let (stream, mut child) = spawn_proxy(&mut cmd)?;
 
                 error.take();
 
@@ -498,22 +491,99 @@ pub fn unix_connect_with_retry(
                 }
 
                 if error.is_none() {
-                    #[cfg(unix)]
-                    unsafe {
-                        use std::os::unix::io::{FromRawFd, IntoRawFd};
-                        return Ok(UnixStream::from_raw_fd(a.into_raw_fd()));
-                    }
-                    #[cfg(windows)]
-                    unsafe {
-                        use std::os::windows::io::{FromRawSocket, IntoRawSocket};
-                        return Ok(UnixStream::from_raw_socket(a.into_raw_socket()));
-                    }
+                    return Ok(stream);
                 }
             }
         }
     }
 
     error.expect("only get here after at least one unix fail")
+}
+
+/// Spawn a proxy command whose stdin and stdout are connected to the
+/// returned stream.
+#[cfg(unix)]
+fn spawn_proxy(
+    cmd: &mut std::process::Command,
+) -> anyhow::Result<(UnixStream, std::process::Child)> {
+    use std::os::unix::io::{FromRawFd, IntoRawFd};
+
+    let (a, b) = filedescriptor::socketpair()?;
+
+    cmd.stdin(b.as_stdio()?);
+    cmd.stdout(b.as_stdio()?);
+    cmd.stderr(std::process::Stdio::inherit());
+    let child = cmd
+        .spawn()
+        .with_context(|| format!("spawning proxy command {:?}", cmd))?;
+
+    let stream = unsafe { UnixStream::from_raw_fd(a.into_raw_fd()) };
+    Ok((stream, child))
+}
+
+/// Spawn a proxy command whose stdin and stdout are connected to the
+/// returned stream.
+///
+/// The command gets pipes rather than one end of a socket pair. The sockets
+/// from filedescriptor::socketpair are not overlapped, and Windows serializes
+/// all I/O on such a synchronous handle: while the command waits for its
+/// next request on stdin, it cannot write the response to stdout, the same
+/// socket. wsl.exe works that way, so connecting through
+/// `wsl.exe ... wezterm cli proxy` hung at the version check.
+/// Two threads relay between the pipes and a loopback connection instead.
+#[cfg(windows)]
+fn spawn_proxy(
+    cmd: &mut std::process::Command,
+) -> anyhow::Result<(UnixStream, std::process::Child)> {
+    use std::net::{Ipv4Addr, Shutdown, TcpListener};
+    use std::os::windows::io::{FromRawSocket, IntoRawSocket};
+    use std::os::windows::process::CommandExt;
+    use std::process::Stdio;
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+
+    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))?;
+    let ours = TcpStream::connect(listener.local_addr()?)?;
+    let (relay, peer) = listener.accept()?;
+    drop(listener);
+    // Another local process could have connected first
+    anyhow::ensure!(
+        peer == ours.local_addr()?,
+        "unexpected connection from {peer} to the proxy relay"
+    );
+    // The protocol exchanges many small PDUs; don't let Nagle delay them
+    ours.set_nodelay(true)?;
+    relay.set_nodelay(true)?;
+
+    cmd.stdin(Stdio::piped());
+    cmd.stdout(Stdio::piped());
+    cmd.stderr(Stdio::inherit());
+    // The gui has no console to share, so a console program such as
+    // wsl.exe would get a window of its own that stays open for the
+    // lifetime of the connection. The flip side: the command cannot prompt
+    // on a console, so ssh needs key or agent authentication here.
+    cmd.creation_flags(CREATE_NO_WINDOW);
+    let mut child = cmd
+        .spawn()
+        .with_context(|| format!("spawning proxy command {:?}", cmd))?;
+
+    let mut child_stdin = child.stdin.take().expect("stdin is piped");
+    let mut child_stdout = child.stdout.take().expect("stdout is piped");
+    let mut from_client = relay.try_clone()?;
+    let mut to_client = relay;
+
+    // Ends when the client closes the connection; dropping child_stdin
+    // then lets the command see EOF and exit
+    thread::spawn(move || {
+        let _ = std::io::copy(&mut from_client, &mut child_stdin);
+    });
+    // Ends when the command exits; the client then sees EOF
+    thread::spawn(move || {
+        let _ = std::io::copy(&mut child_stdout, &mut to_client);
+        let _ = to_client.shutdown(Shutdown::Write);
+    });
+
+    let stream = unsafe { UnixStream::from_raw_socket(ours.into_raw_socket()) };
+    Ok((stream, child))
 }
 
 #[async_trait(?Send)]
@@ -1389,4 +1459,52 @@ impl Client {
         GetPaneDirectionResponse
     );
     rpc!(adjust_pane_size, AdjustPaneSize, UnitResponse);
+}
+
+#[cfg(all(test, windows))]
+mod test {
+    use super::*;
+
+    #[test]
+    fn proxy_command_relays_both_ways() {
+        use std::os::windows::process::CommandExt;
+        // Echo one line, then wait for EOF on stdin. cmd.exe writes
+        // unbuffered; findstr and friends would hold the echo back
+        // until EOF.
+        let mut cmd = std::process::Command::new("cmd.exe");
+        cmd.raw_arg(r#"/v:on /c "set /p line=&echo !line!&more>nul""#);
+        let (mut stream, mut child) = spawn_proxy(&mut cmd).unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(10)))
+            .unwrap();
+
+        stream.write_all(b"ping\r\n").unwrap();
+        let mut echoed = Vec::new();
+        let mut buf = [0u8; 64];
+        while !echoed.ends_with(b"\n") {
+            let n = stream.read(&mut buf).unwrap();
+            assert_ne!(n, 0, "proxy closed early");
+            echoed.extend_from_slice(&buf[..n]);
+        }
+        assert_eq!(echoed, b"ping\r\n");
+
+        // Closing the connection must end the command
+        drop(stream);
+        assert!(child.wait().unwrap().success());
+    }
+
+    #[test]
+    fn proxy_command_exit_reaches_the_client_as_eof() {
+        let mut cmd = std::process::Command::new("cmd.exe");
+        cmd.args(["/c", "echo", "bye"]);
+        let (mut stream, mut child) = spawn_proxy(&mut cmd).unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(10)))
+            .unwrap();
+
+        let mut output = Vec::new();
+        stream.read_to_end(&mut output).unwrap();
+        assert_eq!(output, b"bye\r\n");
+        assert!(child.wait().unwrap().success());
+    }
 }
