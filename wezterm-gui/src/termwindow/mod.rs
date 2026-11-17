@@ -421,6 +421,9 @@ pub struct TermWindow {
 
     current_modifier_and_leds: (Modifiers, KeyboardLedStatus),
     current_mouse_buttons: Vec<MousePress>,
+    /// Presses eaten by the popup menu: their releases must not reach the
+    /// terminal. One entry per button, so two held buttons both stay eaten
+    swallow_release: Vec<MousePress>,
     current_mouse_capture: Option<MouseCapture>,
 
     opengl_info: Option<String>,
@@ -734,6 +737,7 @@ impl TermWindow {
             tab_state: RefCell::new(HashMap::new()),
             pane_state: RefCell::new(HashMap::new()),
             current_mouse_buttons: vec![],
+            swallow_release: vec![],
             current_mouse_capture: None,
             last_mouse_click: None,
             current_highlight: None,

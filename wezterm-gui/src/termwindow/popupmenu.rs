@@ -23,6 +23,7 @@ use config::keyassignment::{
 use config::Dimension;
 use mux_lua::MuxPane;
 use std::cell::{Cell, Ref, RefCell};
+use std::io::Read;
 use std::rc::Rc;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -81,18 +82,65 @@ fn image_lines(entry: &PopupMenuEntry) -> f32 {
     }
 }
 
-/// Reads a picture for an entry; a missing, empty or huge file gives None,
-/// so the entry is shown without it
+/// At most this many pictures are loaded per menu; later entries have none
+const MAX_IMAGES: usize = 8;
+/// Pictures with a larger width or height (in pixels) are not shown. Menu
+/// pictures are small cards; 1024 keeps a decoded frame at 4 MiB
+const MAX_IMAGE_DIMENSION: u32 = 1024;
+
+/// Reads at most `max` bytes; None when the source is longer
+fn read_limited(reader: impl std::io::Read, max: u64) -> std::io::Result<Option<Vec<u8>>> {
+    let mut data = Vec::new();
+    reader.take(max + 1).read_to_end(&mut data)?;
+    Ok(if data.len() as u64 > max {
+        None
+    } else {
+        Some(data)
+    })
+}
+
+/// Whether the picture size (from its header) is acceptable
+fn dimensions_ok(width: u32, height: u32) -> bool {
+    width <= MAX_IMAGE_DIMENSION && height <= MAX_IMAGE_DIMENSION
+}
+
+/// Reads a picture for an entry; a missing, empty, huge or oversized file
+/// gives None, so the entry is shown without it
 fn load_image(path: &str) -> Option<Arc<ImageData>> {
-    let len = std::fs::metadata(path).ok()?.len();
-    if len == 0 || len > MAX_IMAGE_BYTES {
-        log::debug!("PopupMenu: skipping image {path} ({len} bytes)");
-        return None;
-    }
-    match std::fs::read(path) {
-        Ok(data) => Some(Arc::new(ImageData::with_raw_data(data))),
+    let file = match std::fs::File::open(path) {
+        Ok(file) => file,
         Err(err) => {
-            log::debug!("PopupMenu: cannot read image {path}: {err:#}");
+            log::warn!("PopupMenu: cannot open image {path}: {err:#}");
+            return None;
+        }
+    };
+    let data = match read_limited(file, MAX_IMAGE_BYTES) {
+        Ok(Some(data)) if !data.is_empty() => data,
+        Ok(Some(_)) => {
+            log::warn!("PopupMenu: skipping empty image {path}");
+            return None;
+        }
+        Ok(None) => {
+            log::warn!("PopupMenu: skipping image {path} (over {MAX_IMAGE_BYTES} bytes)");
+            return None;
+        }
+        Err(err) => {
+            log::warn!("PopupMenu: cannot read image {path}: {err:#}");
+            return None;
+        }
+    };
+    let dims = image::ImageReader::new(std::io::Cursor::new(&data))
+        .with_guessed_format()
+        .map_err(anyhow::Error::from)
+        .and_then(|r| r.into_dimensions().map_err(anyhow::Error::from));
+    match dims {
+        Ok((w, h)) if dimensions_ok(w, h) => Some(Arc::new(ImageData::with_raw_data(data))),
+        Ok((w, h)) => {
+            log::warn!("PopupMenu: skipping image {path} ({w}x{h} pixels is too large)");
+            None
+        }
+        Err(err) => {
+            log::warn!("PopupMenu: cannot read the size of image {path}: {err:#}");
             None
         }
     }
@@ -460,10 +508,23 @@ impl PopupMenuModal {
                 anyhow::bail!("PopupMenu requires action to be defined by wezterm.action_callback")
             }
         };
+        // Only items show a picture (see entry_height)
+        let mut loaded = 0;
         let images = args
             .entries
             .iter()
-            .map(|e| e.image.as_deref().and_then(load_image))
+            .map(|e| {
+                let path = e.image.as_deref()?;
+                if !matches!(e.kind, PopupMenuEntryKind::Item) {
+                    return None;
+                }
+                if loaded >= MAX_IMAGES {
+                    log::warn!("PopupMenu: more than {MAX_IMAGES} images, skipping {path}");
+                    return None;
+                }
+                loaded += 1;
+                load_image(path)
+            })
             .collect();
         Ok(Self {
             images,
@@ -538,6 +599,8 @@ impl PopupMenuModal {
             MouseOutcome::Scroll(delta) => {
                 let top = *self.top.borrow();
                 *self.top.borrow_mut() = (top as isize + delta).max(0) as usize;
+                // Otherwise the highlighted item would be kept in view
+                *self.selected.borrow_mut() = None;
                 term_window.invalidate_modal();
                 true
             }
@@ -1311,5 +1374,28 @@ mod test {
         // Scrolled past the end: pulled back so that the space is used
         assert_eq!(scroll_to_show(&heights, 9, None, 35.), 7);
         assert_eq!(scroll_to_show(&heights, 0, None, 1000.), 0);
+    }
+
+    #[test]
+    fn image_reads_are_limited() {
+        assert_eq!(
+            read_limited(&[1u8, 2, 3][..], 3).unwrap(),
+            Some(vec![1, 2, 3])
+        );
+        assert_eq!(read_limited(&[1u8, 2, 3, 4][..], 3).unwrap(), None);
+        assert_eq!(read_limited(&[][..], 3).unwrap(), Some(vec![]));
+        assert!(dimensions_ok(MAX_IMAGE_DIMENSION, MAX_IMAGE_DIMENSION));
+        assert!(dimensions_ok(640, 640));
+        assert!(!dimensions_ok(MAX_IMAGE_DIMENSION + 1, 10));
+        assert!(!dimensions_ok(10, 100_000));
+    }
+
+    #[test]
+    fn missing_or_bogus_images_do_not_panic() {
+        assert!(load_image("/nonexistent/definitely/missing.png").is_none());
+        let path = std::env::temp_dir().join("wezterm-popupmenu-bogus.png");
+        std::fs::write(&path, b"not an image").unwrap();
+        assert!(load_image(path.to_str().unwrap()).is_none());
+        let _ = std::fs::remove_file(&path);
     }
 }
