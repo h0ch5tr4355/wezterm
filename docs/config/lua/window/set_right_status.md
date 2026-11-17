@@ -139,3 +139,49 @@ wezterm.on('update-right-status', function(window, pane)
   window:set_right_status(wezterm.format(elements))
 end)
 ```
+
+### Clickable parts
+
+{{since('nightly')}}
+
+Parts of the status can be OSC 8 hyperlinks. The mouse pointer changes when
+it is over a linked part, and a left click emits the
+[open-uri](../window-events/open-uri.md) event with the link's URI, just like
+a hyperlink in the terminal output. Unlike there, a URI that no handler takes
+is only opened by the system when it is a `http`, `https` or `mailto` URI. That way a scheme of your own, used to dispatch to your handler, never
+ends up in an error dialog when the handler is missing.
+
+The handler can show a [PopupMenu](../keyassignment/PopupMenu.md); it then
+opens underneath the part that was clicked, like a menu of the macOS menu bar.
+
+`wezterm.format` has no item for hyperlinks, so add the escape sequences as
+`Text` items. Text you did not write yourself, such as a pane title or a
+working directory, can contain escape sequences too; strip control characters
+from it, or a program could place a link of its own in your status.
+
+```lua
+local wezterm = require 'wezterm'
+
+local function link(uri, text)
+  return {
+    { Text = '\x1b]8;;' .. uri .. '\x1b\\' },
+    { Text = text },
+    { Text = '\x1b]8;;\x1b\\' },
+  }
+end
+
+wezterm.on('update-right-status', function(window, pane)
+  local items = link('my-status:clock', wezterm.strftime ' %H:%M ')
+  window:set_right_status(wezterm.format(items))
+end)
+
+wezterm.on('open-uri', function(window, pane, uri)
+  if uri == 'my-status:clock' then
+    window:toast_notification('wezterm', wezterm.strftime '%A, %d %B %Y', nil, 4000)
+    -- handled: stop here
+    return false
+  end
+end)
+
+return {}
+```

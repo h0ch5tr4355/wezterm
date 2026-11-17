@@ -2,7 +2,7 @@
 
 use crate::color::LinearRgba;
 use crate::customglyph::{BlockKey, Poly};
-use crate::glyphcache::CachedGlyph;
+use crate::glyphcache::{CachedGlyph, LoadState};
 use crate::quad::{QuadImpl, QuadTrait, TripleLayerQuadAllocator, TripleLayerQuadAllocatorTrait};
 use crate::termwindow::{
     ColorEase, MouseCapture, RenderState, TermWindowNotif, UIItem, UIItemType,
@@ -14,7 +14,9 @@ use config::{Dimension, DimensionContext};
 use finl_unicode::grapheme_clusters::Graphemes;
 use std::cell::RefCell;
 use std::rc::Rc;
+use std::sync::Arc;
 use termwiz::cell::{grapheme_column_width, Presentation};
+use termwiz::image::ImageData;
 use termwiz::surface::Line;
 use wezterm_font::units::PixelUnit;
 use wezterm_font::LoadedFont;
@@ -394,7 +396,17 @@ impl Element {
 pub enum ElementContent {
     Text(String),
     Children(Vec<Element>),
-    Poly { line_width: isize, poly: SizedPoly },
+    Poly {
+        line_width: isize,
+        poly: SizedPoly,
+    },
+    /// A picture, scaled to fit into `width` x `height` with its
+    /// aspect ratio kept
+    Image {
+        data: Arc<ImageData>,
+        width: Dimension,
+        height: Dimension,
+    },
 }
 
 pub struct LayoutContext<'a> {
@@ -441,7 +453,7 @@ impl ComputedElement {
                 }
             }
             ComputedElementContent::Text(_) => {}
-            ComputedElementContent::Poly { .. } => {}
+            ComputedElementContent::Poly { .. } | ComputedElementContent::Image { .. } => {}
         }
     }
 
@@ -469,7 +481,7 @@ impl ComputedElement {
                     kid.ui_item_impl(items);
                 }
             }
-            ComputedElementContent::Poly { .. } => {}
+            ComputedElementContent::Poly { .. } | ComputedElementContent::Image { .. } => {}
         }
     }
 }
@@ -482,6 +494,25 @@ pub enum ComputedElementContent {
         line_width: isize,
         poly: PixelSizedPoly,
     },
+    /// `loaded` is false while the image is still being decoded; nothing
+    /// is drawn then
+    Image {
+        sprite: Sprite,
+        size: euclid::Size2D<f32, PixelUnit>,
+        loaded: bool,
+    },
+}
+
+impl ComputedElement {
+    /// True when an image of this element (or of its children) has not
+    /// been decoded yet, so the layout must be computed again later
+    pub fn has_pending_image(&self) -> bool {
+        match &self.content {
+            ComputedElementContent::Image { loaded, .. } => !loaded,
+            ComputedElementContent::Children(kids) => kids.iter().any(|k| k.has_pending_image()),
+            ComputedElementContent::Text(_) | ComputedElementContent::Poly { .. } => false,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -821,6 +852,45 @@ impl super::TermWindow {
                     },
                 })
             }
+            ElementContent::Image {
+                data,
+                width,
+                height,
+            } => {
+                let box_width = width.evaluate_as_pixels(context.width);
+                let box_height = height.evaluate_as_pixels(context.height);
+                let (sprite, _next_due, load_state) = context
+                    .gl_state
+                    .glyph_cache
+                    .borrow_mut()
+                    .cached_image(data, None, self.allow_images)?;
+                let tex_width = (sprite.coords.width() as f32).max(1.);
+                let tex_height = (sprite.coords.height() as f32).max(1.);
+                let scale = (box_width / tex_width).min(box_height / tex_height);
+                let size = euclid::size2(tex_width * scale, tex_height * scale);
+                let content_rect =
+                    euclid::rect(0., 0., box_width.max(min_width), box_height.max(min_height));
+                let rects = element.compute_rects(context, content_rect);
+
+                Ok(ComputedElement {
+                    item_type: element.item_type.clone(),
+                    zindex: element.zindex + context.zindex,
+                    baseline,
+                    border,
+                    border_corners,
+                    colors: element.colors.clone(),
+                    hover_colors: element.hover_colors.clone(),
+                    bounds: rects.bounds,
+                    border_rect: rects.border_rect,
+                    padding: rects.padding,
+                    content_rect: rects.content_rect,
+                    content: ComputedElementContent::Image {
+                        sprite,
+                        size,
+                        loaded: load_state == LoadState::Loaded,
+                    },
+                })
+            }
         }
     }
 
@@ -939,6 +1009,30 @@ impl super::TermWindow {
                         LinearRgba::TRANSPARENT,
                     )?;
                     self.resolve_text(colors, inherited_colors).apply(&mut quad);
+                }
+            }
+            ComputedElementContent::Image {
+                sprite,
+                size,
+                loaded,
+            } => {
+                if *loaded {
+                    // Centered in its box
+                    let x = element.content_rect.min_x()
+                        + (element.content_rect.width() - size.width) / 2.;
+                    let y = element.content_rect.min_y()
+                        + (element.content_rect.height() - size.height) / 2.;
+                    let mut quad = layers.allocate(1)?;
+                    quad.set_position(
+                        x + left,
+                        y + top,
+                        x + left + size.width,
+                        y + top + size.height,
+                    );
+                    quad.set_fg_color(LinearRgba::with_components(1., 1., 1., 1.));
+                    quad.set_texture(sprite.texture_coords());
+                    quad.set_has_color(true);
+                    quad.set_hsv(None);
                 }
             }
         }

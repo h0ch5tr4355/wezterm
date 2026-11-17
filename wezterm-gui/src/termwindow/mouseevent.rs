@@ -1,6 +1,8 @@
 use crate::tabbar::TabBarItem;
+use crate::termwindow::popupmenu::{PopupMenuModal, StatusLinkAnchor};
 use crate::termwindow::{
-    GuiWin, MouseCapture, PositionedSplit, ScrollHit, TermWindowNotif, UIItem, UIItemType, TMB,
+    GuiWin, MouseCapture, OpenUriFallback, PositionedSplit, ScrollHit, TermWindowNotif, UIItem,
+    UIItemType, TMB,
 };
 use ::window::{
     CursorIcon, MouseButtons as WMB, MouseEvent, MouseEventKind as WMEK, MousePress,
@@ -43,7 +45,8 @@ impl super::TermWindow {
             | UIItemType::AboveScrollThumb
             | UIItemType::BelowScrollThumb
             | UIItemType::ScrollThumb
-            | UIItemType::Split(_) => {}
+            | UIItemType::Split(_)
+            | UIItemType::PopupMenu(_) => {}
         }
     }
 
@@ -54,7 +57,8 @@ impl super::TermWindow {
             | UIItemType::AboveScrollThumb
             | UIItemType::BelowScrollThumb
             | UIItemType::ScrollThumb
-            | UIItemType::Split(_) => {}
+            | UIItemType::Split(_)
+            | UIItemType::PopupMenu(_) => {}
         }
     }
 
@@ -216,6 +220,13 @@ impl super::TermWindow {
             None
         };
 
+        if self.popup_menu_mouse_event(&event, ui_item.as_ref(), context) {
+            if prior_ui_item != ui_item {
+                self.update_title_post_status();
+            }
+            return;
+        }
+
         if let Some(item) = ui_item.clone() {
             if capture_mouse {
                 self.current_mouse_capture = Some(MouseCapture::UI);
@@ -242,6 +253,35 @@ impl super::TermWindow {
         if prior_ui_item != ui_item {
             self.update_title_post_status();
         }
+    }
+
+    /// While a popup menu is open, it sees mouse events first.
+    /// Returns true when the event must not go further.
+    fn popup_menu_mouse_event(
+        &mut self,
+        event: &MouseEvent,
+        ui_item: Option<&UIItem>,
+        context: &dyn WindowOps,
+    ) -> bool {
+        let modal = match self.get_modal() {
+            Some(modal) => modal,
+            None => return false,
+        };
+        let menu = match modal.downcast_ref::<PopupMenuModal>() {
+            Some(menu) => menu,
+            None => return false,
+        };
+        let (hit, over_link) = match ui_item.map(|item| &item.item_type) {
+            Some(UIItemType::PopupMenu(hit)) => (Some(*hit), None),
+            Some(UIItemType::TabBar(TabBarItem::StatusLink(idx))) => (None, Some(*idx)),
+            _ => (None, None),
+        };
+        let streak = self.last_mouse_click.as_ref().map_or(0, |c| c.streak);
+        let consumed = menu.window_mouse_event(event, hit, over_link, streak, self);
+        if consumed {
+            context.set_cursor(Some(CursorIcon::Default));
+        }
+        consumed
     }
 
     pub fn mouse_leave_impl(&mut self, context: &dyn WindowOps) {
@@ -382,6 +422,8 @@ impl super::TermWindow {
             UIItemType::CloseTab(idx) => {
                 self.mouse_event_close_tab(idx, event, context);
             }
+            // Handled by the menu itself in mouse_event_impl
+            UIItemType::PopupMenu(_) => {}
         }
     }
 
@@ -467,6 +509,32 @@ impl super::TermWindow {
                 TabBarItem::NewTabButton { .. } => {
                     self.do_new_tab_button_click(MousePress::Left);
                 }
+                TabBarItem::StatusLink(idx) => {
+                    // While an overlay (such as the menu a click opened) or a
+                    // modal is up, a second click would only stack another one.
+                    // The overlay of a double click's first press only appears
+                    // once the async open-uri handler ran, so skip the second
+                    // press of a streak as well.
+                    let repeated = self
+                        .last_mouse_click
+                        .as_ref()
+                        .map_or(false, |c| c.streak > 1);
+                    let busy = repeated
+                        || self.get_modal().is_some()
+                        || self.get_active_pane_or_overlay().map(|p| p.pane_id())
+                            != self.get_active_pane_no_overlay().map(|p| p.pane_id());
+                    let link = self.tab_bar.status_link(idx).map(|l| l.uri().to_string());
+                    // A popup menu shown by the handler opens underneath the link
+                    self.status_link_anchor = match (&self.last_ui_item, busy) {
+                        (Some(item), false) => Some(StatusLinkAnchor::new(item, idx)),
+                        _ => None,
+                    };
+                    if let (false, Some(uri), Some(pane)) =
+                        (busy, link, self.get_active_pane_no_overlay())
+                    {
+                        self.open_uri(&pane, uri, OpenUriFallback::WebOnly);
+                    }
+                }
                 TabBarItem::None | TabBarItem::LeftStatus | TabBarItem::RightStatus => {
                     let maximized = self
                         .window_state
@@ -520,6 +588,7 @@ impl super::TermWindow {
                 TabBarItem::None
                 | TabBarItem::LeftStatus
                 | TabBarItem::RightStatus
+                | TabBarItem::StatusLink(_)
                 | TabBarItem::WindowButton(_) => {}
             },
             WMEK::Press(MousePress::Right) => match item {
@@ -532,6 +601,7 @@ impl super::TermWindow {
                 TabBarItem::None
                 | TabBarItem::LeftStatus
                 | TabBarItem::RightStatus
+                | TabBarItem::StatusLink(_)
                 | TabBarItem::WindowButton(_) => {}
             },
             WMEK::Move => match item {
@@ -550,7 +620,8 @@ impl super::TermWindow {
                 }
                 TabBarItem::WindowButton(_)
                 | TabBarItem::Tab { .. }
-                | TabBarItem::NewTabButton { .. } => {}
+                | TabBarItem::NewTabButton { .. }
+                | TabBarItem::StatusLink(_) => {}
             },
             WMEK::VertWheel(n) => {
                 if self.config.mouse_wheel_scrolls_tabs {
@@ -560,7 +631,11 @@ impl super::TermWindow {
             }
             _ => {}
         }
-        context.set_cursor(Some(CursorIcon::Default));
+        // Like a hyperlink in the terminal, a linked status part shows that it can be clicked
+        context.set_cursor(Some(match item {
+            TabBarItem::StatusLink(_) => CursorIcon::Pointer,
+            _ => CursorIcon::Default,
+        }));
     }
 
     pub fn mouse_event_above_scroll_thumb(
