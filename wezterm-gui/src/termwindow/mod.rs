@@ -78,6 +78,7 @@ pub mod modal;
 mod mouseevent;
 pub mod palette;
 pub mod paneselect;
+pub mod popupmenu;
 mod prevcursor;
 pub mod render;
 pub mod resize;
@@ -160,6 +161,8 @@ pub enum UIItemType {
     ScrollThumb,
     BelowScrollThumb,
     Split(PositionedSplit),
+    /// An item of a popup menu, or (None) the rest of the menu
+    PopupMenu(Option<usize>),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -399,6 +402,8 @@ pub struct TermWindow {
     pub left_status: String,
     last_ui_item: Option<UIItem>,
     taskbar_progress: TaskbarProgress,
+    /// The status bar link clicked last, where its popup menu opens
+    status_link_anchor: Option<popupmenu::StatusLinkAnchor>,
     /// Tracks whether the current mouse-down event is part of click-focus.
     /// If so, we ignore mouse events until released
     is_click_to_focus_window: bool,
@@ -791,6 +796,7 @@ impl TermWindow {
             dragging: None,
             last_ui_item: None,
             taskbar_progress: TaskbarProgress::None,
+            status_link_anchor: None,
             is_click_to_focus_window: false,
             key_table_state: KeyTableState::default(),
             modal: RefCell::new(None),
@@ -2326,6 +2332,21 @@ impl TermWindow {
         promise::spawn::spawn(future).detach();
     }
 
+    fn show_popup_menu(&mut self, args: &config::keyassignment::PopupMenu) {
+        let pane = match self.get_active_pane_no_overlay() {
+            Some(pane) => MuxPane(pane.pane_id()),
+            None => return,
+        };
+        let anchor = self
+            .status_link_anchor
+            .take()
+            .filter(|a| a.is_fresh(std::time::Instant::now()));
+        match popupmenu::PopupMenuModal::new(self, args.clone(), pane, anchor) {
+            Ok(menu) => self.set_modal(Rc::new(menu)),
+            Err(err) => log::error!("PopupMenu: {err:#}"),
+        }
+    }
+
     fn show_prompt_input_line(&mut self, args: &PromptInputLine) {
         let mux = Mux::get();
         let tab = match mux.get_active_tab_for_window(self.mux_window_id) {
@@ -3188,6 +3209,7 @@ impl TermWindow {
             PromptInputLine(args) => self.show_prompt_input_line(args),
             InputSelector(args) => self.show_input_selector(args),
             Confirmation(args) => self.show_confirmation(args),
+            PopupMenu(args) => self.show_popup_menu(args),
         };
         Ok(PerformAssignmentResult::Handled)
     }
@@ -3201,6 +3223,14 @@ impl TermWindow {
         // perform below; here we allow the user to define an `open-uri` event
         // handler that can bypass the normal `open_url` functionality.
         if let Some(link) = self.current_highlight.as_ref().cloned() {
+            self.open_uri(pane, link.uri().to_string(), OpenUriFallback::Any);
+        }
+    }
+
+    /// Emits `open-uri` for `uri` and opens it unless a handler returns
+    /// false. Also used for hyperlinks in the left and right status.
+    pub fn open_uri(&self, pane: &Arc<dyn Pane>, uri: String, fallback: OpenUriFallback) {
+        {
             let window = GuiWin::new(self);
             let pane = MuxPane(pane.pane_id());
 
@@ -3209,6 +3239,7 @@ impl TermWindow {
                 window: GuiWin,
                 pane: MuxPane,
                 link: String,
+                fallback: OpenUriFallback,
             ) -> anyhow::Result<()> {
                 let default_click = match lua {
                     Some(lua) => {
@@ -3222,15 +3253,17 @@ impl TermWindow {
                     }
                     None => true,
                 };
-                if default_click {
+                if default_click && fallback.allows(&link) {
                     log::info!("clicking {}", link);
                     wezterm_open_url::open_url(&link);
+                } else if default_click {
+                    log::warn!("no open-uri handler took {link}; not opening it");
                 }
                 Ok(())
             }
 
             promise::spawn::spawn(config::with_lua_config_on_main_thread(move |lua| {
-                open_uri(lua, window, pane, link.uri().to_string())
+                open_uri(lua, window, pane, uri, fallback)
             }))
             .detach();
         }
@@ -3656,6 +3689,58 @@ impl Drop for TermWindow {
             if let Some(fe) = try_front_end() {
                 fe.forget_known_window(&window);
             }
+        }
+    }
+}
+
+/// What `TermWindow::open_uri` does with a URI that no `open-uri` handler
+/// took.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OpenUriFallback {
+    /// Hand it to the system, as for hyperlinks in the terminal output.
+    Any,
+    /// Only web and mail URIs. Status bar links usually carry a scheme of
+    /// the config's own (`my-status:k8s`) that the system cannot open;
+    /// without a handler (say, after a config error) the click would
+    /// otherwise end in an error dialog. `file:` is left out on purpose: the
+    /// system would run what it points at.
+    WebOnly,
+}
+
+impl OpenUriFallback {
+    pub fn allows(self, uri: &str) -> bool {
+        match self {
+            Self::Any => true,
+            Self::WebOnly => match uri.split_once(':') {
+                Some((scheme, _)) => matches!(
+                    scheme.to_ascii_lowercase().as_str(),
+                    "http" | "https" | "mailto"
+                ),
+                None => false,
+            },
+        }
+    }
+}
+
+#[cfg(test)]
+mod open_uri_fallback_test {
+    use super::OpenUriFallback;
+
+    #[test]
+    fn status_links_only_fall_back_to_web_uris() {
+        for uri in ["https://wezterm.org/", "HTTP://x", "mailto:a@b"] {
+            assert!(OpenUriFallback::WebOnly.allows(uri), "{uri}");
+        }
+        for uri in [
+            "my-status:k8s",
+            "alias://run/x",
+            "javascript:alert(1)",
+            "file:///C:/Windows/System32/calc.exe",
+            "https",
+            "",
+        ] {
+            assert!(!OpenUriFallback::WebOnly.allows(uri), "{uri}");
+            assert!(OpenUriFallback::Any.allows(uri), "{uri}");
         }
     }
 }

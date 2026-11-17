@@ -1,3 +1,4 @@
+use crate::color::RgbaColor;
 use crate::default_true;
 use crate::keys::KeyNoAction;
 use crate::window::WindowLevel;
@@ -533,6 +534,96 @@ fn default_message() -> String {
     "🛑 Really continue?".to_string()
 }
 
+/// What a row of a [PopupMenu] is
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, FromDynamic, ToDynamic)]
+pub enum PopupMenuEntryKind {
+    /// A row with a label and an optional right-aligned detail.
+    /// It can be chosen when it has an `id`.
+    #[default]
+    Item,
+    /// A dimmed section title; it cannot be chosen
+    Header,
+    /// A horizontal rule; it cannot be chosen
+    Separator,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, FromDynamic, ToDynamic)]
+pub struct PopupMenuEntry {
+    #[dynamic(default)]
+    pub kind: PopupMenuEntryKind,
+    #[dynamic(default)]
+    pub label: String,
+    /// Right-aligned text, dimmed unless `detail_color` is set
+    #[dynamic(default)]
+    pub detail: Option<String>,
+    /// Text shown in a narrow column ahead of the label
+    #[dynamic(default)]
+    pub icon: Option<String>,
+    /// Passed to the action callback; an `Item` without an id is disabled
+    #[dynamic(default)]
+    pub id: Option<String>,
+    #[dynamic(default)]
+    pub color: Option<RgbaColor>,
+    #[dynamic(default)]
+    pub detail_color: Option<RgbaColor>,
+    #[dynamic(default)]
+    pub icon_color: Option<RgbaColor>,
+    /// Short text in a rounded box after the label, eg: "PROD"
+    #[dynamic(default)]
+    pub badge: Option<String>,
+    /// Background of the badge; its text uses the menu background color
+    #[dynamic(default)]
+    pub badge_color: Option<RgbaColor>,
+    /// Shows a bar after the label, filled to this fraction (0.0 to 1.0)
+    #[dynamic(default)]
+    pub progress: Option<f32>,
+    #[dynamic(default)]
+    pub progress_color: Option<RgbaColor>,
+    /// Path of a picture (PNG, JPEG, GIF, ...) shown at the left of the
+    /// item. The label, each line of the detail and the progress bar are
+    /// then stacked next to it, like a "now playing" card.
+    /// A file that cannot be read is left out.
+    #[dynamic(default)]
+    pub image: Option<String>,
+    /// Height (and width) of the picture in lines, default 4
+    #[dynamic(default)]
+    pub image_size: Option<f32>,
+}
+
+impl PopupMenuEntry {
+    pub fn is_selectable(&self) -> bool {
+        self.kind == PopupMenuEntryKind::Item && self.id.is_some()
+    }
+}
+
+/// A drop-down menu drawn by the GUI. When a status bar link was clicked
+/// just before, it opens underneath that link, otherwise near the top
+/// right corner of the window.
+#[derive(Debug, Clone, PartialEq, FromDynamic, ToDynamic)]
+pub struct PopupMenu {
+    /// Must be a `wezterm.action_callback`; it is called with
+    /// `(window, pane, id, label)`, and with `id` and `label` set
+    /// to `nil` when the menu was dismissed.
+    pub action: Box<KeyAssignment>,
+    pub entries: Vec<PopupMenuEntry>,
+    /// Defaults to the command palette colors
+    #[dynamic(default)]
+    pub bg_color: Option<RgbaColor>,
+    #[dynamic(default)]
+    pub fg_color: Option<RgbaColor>,
+    /// Text of headers, details and disabled items
+    #[dynamic(default)]
+    pub dim_color: Option<RgbaColor>,
+    /// Background of the highlighted item
+    #[dynamic(default)]
+    pub highlight_color: Option<RgbaColor>,
+    #[dynamic(default)]
+    pub border_color: Option<RgbaColor>,
+    /// Minimum width in cells
+    #[dynamic(default)]
+    pub min_width: Option<usize>,
+}
+
 #[derive(Debug, Clone, PartialEq, FromDynamic, ToDynamic)]
 pub enum KeyAssignment {
     SpawnTab(SpawnTabDomain),
@@ -648,6 +739,7 @@ pub enum KeyAssignment {
     PromptInputLine(PromptInputLine),
     InputSelector(InputSelector),
     Confirmation(Confirmation),
+    PopupMenu(PopupMenu),
 }
 impl_lua_conversion_dynamic!(KeyAssignment);
 

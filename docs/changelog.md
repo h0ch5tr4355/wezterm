@@ -77,6 +77,13 @@ As features stabilize some brief notes about them will accumulate here.
   easier to spot the remaining candidates. Thanks to @mr-felixoid and @bew! #7752
 
 #### New
+* The left and right status can contain OSC 8 hyperlinks. Clicking a linked
+  part emits [open-uri](config/lua/window-events/open-uri.md), and the mouse
+  pointer changes over it, so a status can offer menus of its own. See
+  [window:set_right_status](config/lua/window/set_right_status.md#clickable-parts).
+* [PopupMenu](config/lua/keyassignment/PopupMenu.md) shows a drop-down menu
+  drawn by the GUI, underneath the clicked status part, with headers,
+  separators, icons, badges, progress bars and pictures.
 * [command_palette_line_height](config/lua/config/command_palette_line_height.md)
   option to scale the vertical spacing of rows in the command palette,
   independently of [line_height](config/lua/config/line_height.md) which is for terminal cells only.

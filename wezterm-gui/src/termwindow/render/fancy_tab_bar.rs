@@ -95,7 +95,31 @@ impl crate::TermWindow {
         };
 
         let item_to_elem = |item: &TabEntry| -> Element {
-            let element = Element::with_line(&font, &item.title, palette);
+            let element = match item.item {
+                // Each hyperlinked run of the status becomes its own child,
+                // so that it gets a UI item of its own and can be clicked
+                TabBarItem::RightStatus | TabBarItem::LeftStatus
+                    if self.tab_bar.has_status_links() =>
+                {
+                    let kids = crate::tabbar::status_runs(&item.title)
+                        .into_iter()
+                        .map(|run| {
+                            let kid = Element::with_line(&font, &run.line, palette);
+                            match run
+                                .link
+                                .and_then(|link| self.tab_bar.status_link_index(&link))
+                            {
+                                Some(idx) => {
+                                    kid.item_type(UIItemType::TabBar(TabBarItem::StatusLink(idx)))
+                                }
+                                None => kid,
+                            }
+                        })
+                        .collect();
+                    Element::new(&font, ElementContent::Children(kids))
+                }
+                _ => Element::with_line(&font, &item.title, palette),
+            };
 
             let bg_color = item
                 .title
@@ -118,7 +142,10 @@ impl crate::TermWindow {
             let is_bottom = self.config.tab_bar_at_bottom;
 
             match item.item {
-                TabBarItem::RightStatus | TabBarItem::LeftStatus | TabBarItem::None => element
+                TabBarItem::RightStatus
+                | TabBarItem::LeftStatus
+                | TabBarItem::None
+                | TabBarItem::StatusLink(_) => element
                     .item_type(UIItemType::TabBar(TabBarItem::None))
                     .line_height(Some(1.75))
                     .margin(BoxDimension {
@@ -395,6 +422,9 @@ impl crate::TermWindow {
             match item.item {
                 TabBarItem::LeftStatus => left_status.push(item_to_elem(item)),
                 TabBarItem::None | TabBarItem::RightStatus => right_eles.push(item_to_elem(item)),
+                // Rendered as part of their status above; these entries only
+                // serve the hit testing of the retro tab bar
+                TabBarItem::StatusLink(_) => {}
                 TabBarItem::WindowButton(_) => {
                     if self.config.integrated_title_button_alignment
                         == IntegratedTitleButtonAlignment::Left
@@ -409,7 +439,9 @@ impl crate::TermWindow {
                     elem.max_width = Some(Dimension::Pixels(max_tab_width));
                     elem.content = match elem.content {
                         ElementContent::Text(_) => unreachable!(),
-                        ElementContent::Poly { .. } => unreachable!(),
+                        ElementContent::Poly { .. } | ElementContent::Image { .. } => {
+                            unreachable!()
+                        }
                         ElementContent::Children(mut kids) => {
                             if self.config.show_close_tab_button_in_tabs {
                                 kids.push(make_x_button(&font, &metrics, &colors, tab_idx, active));

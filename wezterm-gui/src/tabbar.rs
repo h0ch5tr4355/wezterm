@@ -2,13 +2,14 @@ use crate::termwindow::{PaneInformation, TabInformation, UIItem, UIItemType};
 use config::{ConfigHandle, TabBarColors};
 use finl_unicode::grapheme_clusters::Graphemes;
 use mlua::FromLua;
-use std::sync::LazyLock;
+use std::sync::{Arc, LazyLock};
 use std::time::{Duration, Instant};
 use termwiz::cell::{unicode_column_width, Cell, CellAttributes};
 use termwiz::color::{AnsiColor, ColorSpec};
 use termwiz::escape::csi::Sgr;
 use termwiz::escape::parser::Parser;
-use termwiz::escape::{Action, ControlCode, CSI};
+use termwiz::escape::{Action, ControlCode, OperatingSystemCommand, CSI};
+use termwiz::hyperlink::Hyperlink;
 use termwiz::surface::SEQ_ZERO;
 use termwiz_funcs::{format_as_escapes, FormatColor, FormatItem};
 use wezterm_term::{Line, Progress};
@@ -22,6 +23,9 @@ pub struct TabBarState {
     /// at which the tab bar should be rebuilt to advance to the next frame;
     /// None when no spinner is visible.
     next_progress_frame_due: Option<Instant>,
+    /// Targets of the OSC 8 hyperlinks in the left and right status, in order
+    /// of first appearance. `TabBarItem::StatusLink` holds an index into it.
+    status_links: Vec<Arc<Hyperlink>>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -29,9 +33,15 @@ pub enum TabBarItem {
     None,
     LeftStatus,
     RightStatus,
-    Tab { tab_idx: usize, active: bool },
+    Tab {
+        tab_idx: usize,
+        active: bool,
+    },
     NewTabButton,
     WindowButton(IntegratedTitleButton),
+    /// A run of left or right status text that carries an OSC 8 hyperlink;
+    /// the index refers to `TabBarState::status_links`.
+    StatusLink(usize),
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -314,6 +324,7 @@ impl TabBarState {
                 width: 1,
             }],
             next_progress_frame_due: None,
+            status_links: vec![],
         }
     }
 
@@ -531,6 +542,7 @@ impl TabBarState {
             Self::integrated_title_buttons(mouse_x, &mut x, config, &mut items, &mut line, &colors);
         }
 
+        let mut status_links = vec![];
         let left_status_line = parse_status_text(left_status, black_cell.attrs().clone());
         if left_status_line.len() > 0 {
             items.push(TabEntry {
@@ -539,6 +551,7 @@ impl TabBarState {
                 x,
                 width: left_status_line.len(),
             });
+            add_status_links(&left_status_line, x, &mut status_links, &mut items);
             x += left_status_line.len();
             line.append_line(left_status_line, SEQ_ZERO);
         }
@@ -671,17 +684,20 @@ impl TabBarState {
 
         let status_space_available = title_width.saturating_sub(x);
 
-        let mut right_status_line = parse_status_text(right_status, black_cell.attrs().clone());
+        let right_status_line = parse_status_text(right_status, black_cell.attrs().clone());
         items.push(TabEntry {
             item: TabBarItem::RightStatus,
             title: right_status_line.clone(),
             x,
             width: status_space_available,
         });
-
-        while right_status_line.len() > status_space_available {
-            right_status_line.remove_cell(0, SEQ_ZERO);
-        }
+        let right_status_line = place_right_status(
+            right_status_line,
+            status_space_available,
+            title_width,
+            &mut status_links,
+            &mut items,
+        );
 
         line.append_line(right_status_line, SEQ_ZERO);
         while line.len() < title_width {
@@ -700,7 +716,22 @@ impl TabBarState {
             line,
             items,
             next_progress_frame_due: has_indeterminate_progress.then(next_spinner_frame_due),
+            status_links,
         }
+    }
+
+    pub fn has_status_links(&self) -> bool {
+        !self.status_links.is_empty()
+    }
+
+    /// The hyperlink behind a `TabBarItem::StatusLink`.
+    pub fn status_link(&self, idx: usize) -> Option<&Arc<Hyperlink>> {
+        self.status_links.get(idx)
+    }
+
+    /// The `TabBarItem::StatusLink` index of a status hyperlink.
+    pub fn status_link_index(&self, link: &Hyperlink) -> Option<usize> {
+        self.status_links.iter().position(|l| **l == *link)
     }
 
     pub fn compute_ui_items(&self, y: usize, cell_height: usize, cell_width: usize) -> Vec<UIItem> {
@@ -718,6 +749,109 @@ impl TabBarState {
 
         items
     }
+}
+
+/// A run of status cells that share the same hyperlink, or have none.
+#[derive(Debug, PartialEq)]
+pub struct StatusRun {
+    /// Cell offset of the run within the status line.
+    pub start: usize,
+    pub line: Line,
+    pub link: Option<Arc<Hyperlink>>,
+}
+
+/// Splits a status line into runs at every change of hyperlink, so that
+/// each linked part can become its own clickable item.
+pub fn status_runs(line: &Line) -> Vec<StatusRun> {
+    let mut runs: Vec<(usize, Vec<Cell>, Option<Arc<Hyperlink>>)> = vec![];
+    for cell_ref in line.visible_cells() {
+        let cell = cell_ref.as_cell();
+        let link = cell.attrs().hyperlink().cloned();
+        // visible_cells() skips the blank that follows a double-wide grapheme;
+        // put it back, as parse_status_text does, or the run would be too narrow
+        let mut cells = vec![cell.clone()];
+        for _ in 1..cell.width() {
+            cells.push(Cell::blank_with_attrs(cell.attrs().clone()));
+        }
+        match runs.last_mut() {
+            Some((_, run_cells, run_link)) if *run_link == link => run_cells.extend(cells),
+            _ => runs.push((cell_ref.cell_index(), cells, link)),
+        }
+    }
+    runs.into_iter()
+        .map(|(start, cells, link)| StatusRun {
+            start,
+            line: Line::from_cells(cells, SEQ_ZERO),
+            link,
+        })
+        .collect()
+}
+
+/// Index of `link` in `links`, appending it when it is new.
+fn status_link_slot(links: &mut Vec<Arc<Hyperlink>>, link: Arc<Hyperlink>) -> usize {
+    match links.iter().position(|l| *l == link) {
+        Some(idx) => idx,
+        None => {
+            links.push(link);
+            links.len() - 1
+        }
+    }
+}
+
+/// Registers every link of a status line. The fancy tab bar renders the
+/// whole status and looks its links up by value, so this has to happen
+/// before the retro tab bar truncates the line to the space it has.
+fn register_status_links(status: &Line, links: &mut Vec<Arc<Hyperlink>>) {
+    for run in status_runs(status) {
+        if let Some(link) = run.link {
+            status_link_slot(links, link);
+        }
+    }
+}
+
+/// Adds a `TabBarItem::StatusLink` entry for every linked run of `status`,
+/// which starts at cell `x` of the tab bar.
+fn add_status_links(
+    status: &Line,
+    x: usize,
+    links: &mut Vec<Arc<Hyperlink>>,
+    items: &mut Vec<TabEntry>,
+) {
+    for run in status_runs(status) {
+        let Some(link) = run.link else { continue };
+        let idx = status_link_slot(links, link);
+        items.push(TabEntry {
+            item: TabBarItem::StatusLink(idx),
+            width: run.line.len(),
+            title: run.line,
+            x: x + run.start,
+        });
+    }
+}
+
+/// Fits the right status into `available` cells by dropping cells from its
+/// start, and adds the `StatusLink` entries for the retro tab bar. The status
+/// ends at `title_width`, the right edge of the space for it. Links that got
+/// dropped stay registered for the fancy tab bar, which renders the whole
+/// status.
+fn place_right_status(
+    mut status: Line,
+    available: usize,
+    title_width: usize,
+    links: &mut Vec<Arc<Hyperlink>>,
+    items: &mut Vec<TabEntry>,
+) -> Line {
+    register_status_links(&status, links);
+    while status.len() > available {
+        status.remove_cell(0, SEQ_ZERO);
+    }
+    add_status_links(
+        &status,
+        title_width.saturating_sub(status.len()),
+        links,
+        items,
+    );
+    status
 }
 
 pub fn parse_status_text(text: &str, default_cell: CellAttributes) -> Line {
@@ -761,7 +895,13 @@ pub fn parse_status_text(text: &str, default_cell: CellAttributes) -> Line {
                 flush_print(&mut print_buffer, &mut cells, &pen);
                 match csi {
                     CSI::Sgr(sgr) => match sgr {
-                        Sgr::Reset => pen = default_cell.clone(),
+                        Sgr::Reset => {
+                            // OSC 8 is independent of SGR: a reset ends the
+                            // styling, not the hyperlink
+                            let link = pen.hyperlink().cloned();
+                            pen = default_cell.clone();
+                            pen.set_hyperlink(link);
+                        }
                         Sgr::Intensity(i) => {
                             pen.set_intensity(i);
                         }
@@ -811,8 +951,13 @@ pub fn parse_status_text(text: &str, default_cell: CellAttributes) -> Line {
                     _ => {}
                 }
             }
-            Action::OperatingSystemCommand(_)
-            | Action::DeviceControl(_)
+            Action::OperatingSystemCommand(osc) => {
+                flush_print(&mut print_buffer, &mut cells, &pen);
+                if let OperatingSystemCommand::SetHyperlink(link) = *osc {
+                    pen.set_hyperlink(link.map(Arc::new));
+                }
+            }
+            Action::DeviceControl(_)
             | Action::Esc(_)
             | Action::KittyImage(_)
             | Action::XtGetTcap(_)
@@ -823,4 +968,234 @@ pub fn parse_status_text(text: &str, default_cell: CellAttributes) -> Line {
     });
     flush_print(&mut print_buffer, &mut cells, &pen);
     Line::from_cells(cells, SEQ_ZERO)
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+
+    fn text(line: &Line) -> String {
+        line.as_str().to_string()
+    }
+
+    #[test]
+    fn status_hyperlinks_split_the_status_into_runs() {
+        let status = "\x1b[1mA\x1b]8;;wezterm-status:k8s\x1b\\ k8s \x1b]8;;\x1b\\B\x1b]8;;https://x/\x1b\\cd\x1b]8;;\x1b\\";
+        let line = parse_status_text(status, CellAttributes::default());
+        assert_eq!(text(&line), "A k8s Bcd");
+
+        let runs = status_runs(&line);
+        let summary: Vec<(usize, String, Option<String>)> = runs
+            .iter()
+            .map(|r| {
+                (
+                    r.start,
+                    text(&r.line),
+                    r.link.as_ref().map(|l| l.uri().to_string()),
+                )
+            })
+            .collect();
+        assert_eq!(
+            summary,
+            vec![
+                (0, "A".to_string(), None),
+                (
+                    1,
+                    " k8s ".to_string(),
+                    Some("wezterm-status:k8s".to_string())
+                ),
+                (6, "B".to_string(), None),
+                (7, "cd".to_string(), Some("https://x/".to_string())),
+            ]
+        );
+        // SGR state carries across the link boundaries
+        assert!(runs
+            .iter()
+            .all(|r| r.line.get_cell(0).unwrap().attrs().intensity()
+                == termwiz::cell::Intensity::Bold));
+    }
+
+    #[test]
+    fn status_link_entries_point_at_their_cells() {
+        let line = parse_status_text(
+            "ab\x1b]8;;wezterm-status:a\x1b\\cd\x1b]8;;\x1b\\e\x1b]8;;wezterm-status:a\x1b\\f\x1b]8;;\x1b\\",
+            CellAttributes::default(),
+        );
+        let (mut links, mut items) = (vec![], vec![]);
+        add_status_links(&line, 10, &mut links, &mut items);
+        // Both runs share one link target
+        assert_eq!(links.len(), 1);
+        let entries: Vec<(TabBarItem, usize, usize)> =
+            items.iter().map(|e| (e.item, e.x, e.width)).collect();
+        assert_eq!(
+            entries,
+            vec![
+                (TabBarItem::StatusLink(0), 12, 2),
+                (TabBarItem::StatusLink(0), 15, 1)
+            ]
+        );
+    }
+
+    fn link_uris(links: &[Arc<Hyperlink>]) -> Vec<String> {
+        links.iter().map(|l| l.uri().to_string()).collect()
+    }
+
+    fn entries(items: &[TabEntry]) -> Vec<(TabBarItem, usize, usize)> {
+        items.iter().map(|e| (e.item, e.x, e.width)).collect()
+    }
+
+    #[test]
+    fn sgr_reset_inside_a_link_keeps_the_link() {
+        // wezterm.format emits a reset when attributes go back to default
+        let line = parse_status_text(
+            "\x1b]8;;wezterm-status:a\x1b\\\x1b[1mbold\x1b[0mplain\x1b]8;;\x1b\\after",
+            CellAttributes::default(),
+        );
+        let runs = status_runs(&line);
+        assert_eq!(runs.len(), 2);
+        assert_eq!(text(&runs[0].line), "boldplain");
+        assert_eq!(runs[0].link.as_ref().unwrap().uri(), "wezterm-status:a");
+        assert_eq!(
+            runs[0].line.get_cell(4).unwrap().attrs().intensity(),
+            termwiz::cell::Intensity::Normal
+        );
+        assert!(runs[1].link.is_none());
+    }
+
+    #[test]
+    fn unclosed_link_runs_to_the_end_and_empty_close_is_harmless() {
+        let line = parse_status_text(
+            "\x1b]8;;\x1b\\a\x1b]8;;wezterm-status:x\x1b\\bc",
+            CellAttributes::default(),
+        );
+        let runs = status_runs(&line);
+        assert_eq!(runs.len(), 2);
+        assert!(runs[0].link.is_none());
+        assert_eq!((runs[1].start, text(&runs[1].line)), (1, "bc".to_string()));
+    }
+
+    #[test]
+    fn wide_graphemes_count_two_cells_in_a_link() {
+        let line = parse_status_text(
+            "a\x1b]8;;wezterm-status:w\x1b\\日本\x1b]8;;\x1b\\b",
+            CellAttributes::default(),
+        );
+        let (mut links, mut items) = (vec![], vec![]);
+        add_status_links(&line, 0, &mut links, &mut items);
+        assert_eq!(entries(&items), vec![(TabBarItem::StatusLink(0), 1, 4)]);
+        assert_eq!(status_runs(&line)[2].start, 5);
+    }
+
+    #[test]
+    fn same_uri_with_different_ids_are_different_links() {
+        let line = parse_status_text(
+            "\x1b]8;id=1;wezterm-status:a\x1b\\x\x1b]8;id=2;wezterm-status:a\x1b\\y\x1b]8;;\x1b\\",
+            CellAttributes::default(),
+        );
+        let (mut links, mut items) = (vec![], vec![]);
+        add_status_links(&line, 0, &mut links, &mut items);
+        assert_eq!(links.len(), 2);
+        assert_eq!(
+            entries(&items),
+            vec![
+                (TabBarItem::StatusLink(0), 0, 1),
+                (TabBarItem::StatusLink(1), 1, 1)
+            ]
+        );
+    }
+
+    #[test]
+    fn truncated_right_status_keeps_all_links_registered() {
+        // "AAAA" + link a "bb" + "CC" + link b "dd": 10 cells, room for 5
+        let line = parse_status_text(
+            "AAAA\x1b]8;;s:a\x1b\\bb\x1b]8;;\x1b\\CC\x1b]8;;s:b\x1b\\dd\x1b]8;;\x1b\\",
+            CellAttributes::default(),
+        );
+        let (mut links, mut items) = (vec![], vec![]);
+        let shown = place_right_status(line, 5, 80, &mut links, &mut items);
+        assert_eq!(text(&shown), "bCCdd");
+        assert_eq!(link_uris(&links), vec!["s:a", "s:b"]);
+        // The status ends at the right edge: cells 75..80
+        assert_eq!(
+            entries(&items),
+            vec![
+                (TabBarItem::StatusLink(0), 75, 1),
+                (TabBarItem::StatusLink(1), 78, 2)
+            ]
+        );
+    }
+
+    #[test]
+    fn a_link_cut_off_entirely_is_registered_but_not_clickable() {
+        let line = parse_status_text(
+            "\x1b]8;;s:gone\x1b\\xx\x1b]8;;\x1b\\yy\x1b]8;;s:kept\x1b\\z\x1b]8;;\x1b\\",
+            CellAttributes::default(),
+        );
+        let (mut links, mut items) = (vec![], vec![]);
+        let shown = place_right_status(line, 3, 10, &mut links, &mut items);
+        assert_eq!(text(&shown), "yyz");
+        assert_eq!(link_uris(&links), vec!["s:gone", "s:kept"]);
+        assert_eq!(entries(&items), vec![(TabBarItem::StatusLink(1), 9, 1)]);
+    }
+
+    #[test]
+    fn status_that_fits_is_not_truncated() {
+        let line = parse_status_text(
+            "\x1b]8;;s:a\x1b\\ab\x1b]8;;\x1b\\",
+            CellAttributes::default(),
+        );
+        let (mut links, mut items) = (vec![], vec![]);
+        let shown = place_right_status(line, 40, 40, &mut links, &mut items);
+        assert_eq!(text(&shown), "ab");
+        assert_eq!(entries(&items), vec![(TabBarItem::StatusLink(0), 38, 2)]);
+    }
+
+    #[test]
+    fn other_osc_sequences_are_still_ignored() {
+        let line = parse_status_text("a\x1b]0;title\x07b", CellAttributes::default());
+        assert_eq!(text(&line), "ab");
+        assert!(status_runs(&line).iter().all(|r| r.link.is_none()));
+    }
+
+    #[test]
+    fn cut_through_a_wide_grapheme_keeps_positions_consistent() {
+        // "日本" is 4 cells; with room for 3 the cut lands inside "日"
+        let line = parse_status_text(
+            "\x1b]8;;s:w\x1b\\日本\x1b]8;;\x1b\\",
+            CellAttributes::default(),
+        );
+        let (mut links, mut items) = (vec![], vec![]);
+        let shown = place_right_status(line, 3, 20, &mut links, &mut items);
+        assert!(shown.len() <= 3);
+        let total: usize = items.iter().map(|e| e.width).sum();
+        let first = items.first().map(|e| e.x).unwrap();
+        // The clickable part ends exactly at the right edge
+        assert_eq!(first + total, 20);
+    }
+
+    #[test]
+    fn two_links_with_a_reset_between_stay_separate() {
+        let line = parse_status_text(
+            "\x1b]8;;s:a\x1b\\a\x1b[0m\x1b]8;;\x1b\\ \x1b[1m\x1b]8;;s:b\x1b\\b\x1b]8;;\x1b\\",
+            CellAttributes::default(),
+        );
+        let (mut links, mut items) = (vec![], vec![]);
+        add_status_links(&line, 0, &mut links, &mut items);
+        assert_eq!(link_uris(&links), vec!["s:a", "s:b"]);
+        assert_eq!(
+            entries(&items),
+            vec![
+                (TabBarItem::StatusLink(0), 0, 1),
+                (TabBarItem::StatusLink(1), 2, 1)
+            ]
+        );
+    }
+
+    #[test]
+    fn status_without_links_is_a_single_run() {
+        let line = parse_status_text("\x1b[31mplain", CellAttributes::default());
+        let runs = status_runs(&line);
+        assert_eq!(runs.len(), 1);
+        assert!(runs[0].link.is_none());
+    }
 }

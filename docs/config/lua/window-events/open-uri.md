@@ -3,6 +3,13 @@
 The `open-uri` event is emitted when the `CompleteSelectionOrOpenLinkAtMouseCursor`
 key/mouse assignment is triggered.
 
+{{since('nightly')}}
+
+It is also emitted when you click a hyperlink in the left or right status,
+see [window:set_right_status](../window/set_right_status.md#clickable-parts).
+For those, a URI that no handler takes is only opened when it is a `http`,
+`https` or `mailto` URI.
+
 The default action is to open the active URI in your browser, but if you
 register for this event you can co-opt the default behavior.
 

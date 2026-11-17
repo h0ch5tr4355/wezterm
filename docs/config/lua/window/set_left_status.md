@@ -13,5 +13,6 @@ presentation.
 It is recommended that you use [wezterm.format](../wezterm/format.md) to
 compose the string.
 
-See [window:set_right_status](set_right_status.md) for examples.
+See [window:set_right_status](set_right_status.md) for examples, including
+[clickable parts](set_right_status.md#clickable-parts) with OSC 8 hyperlinks.
 

@@ -814,6 +814,14 @@ pub fn derive_command_from_key_assignment(action: &KeyAssignment) -> Option<Comm
             menubar: &[],
             icon: None,
         },
+        PopupMenu(_) => CommandDef {
+            brief: "Show a drop-down menu".into(),
+            doc: "Shows a menu underneath the status bar link that was clicked".into(),
+            keys: vec![],
+            args: &[ArgType::ActiveWindow],
+            menubar: &[],
+            icon: None,
+        },
         PromptInputLine(_) => CommandDef {
             brief: "Prompt the user for a line of text".into(),
             doc: "Activates the prompt overlay and wait for input".into(),
