@@ -148,7 +148,25 @@ impl crate::TermWindow {
 
     pub fn paint_modal(&mut self) -> anyhow::Result<()> {
         if let Some(modal) = self.get_modal() {
-            for computed in modal.computed_element(self)?.iter() {
+            let elements = match modal.computed_element(self) {
+                Ok(elements) => elements,
+                Err(err) => {
+                    // paint_impl recovers from these by growing the atlas or
+                    // clearing the shape cache, then paints again
+                    let root = err.root_cause();
+                    if root.downcast_ref::<OutOfTextureSpace>().is_some()
+                        || root.downcast_ref::<ClearShapeCache>().is_some()
+                    {
+                        return Err(err);
+                    }
+                    // Anything else would fail on every paint while the overlay,
+                    // now invisible, keeps taking keys and clicks: close it
+                    log::error!("Closing an overlay that cannot be laid out: {:#}", err);
+                    self.cancel_modal();
+                    return Ok(());
+                }
+            };
+            for computed in elements.iter() {
                 let mut ui_items = computed.ui_items();
 
                 let gl_state = self.render_state.as_ref().unwrap();

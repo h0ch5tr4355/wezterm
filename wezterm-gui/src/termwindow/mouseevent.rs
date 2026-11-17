@@ -129,6 +129,11 @@ impl super::TermWindow {
             WMEK::Release(ref press) => {
                 self.current_mouse_capture = None;
                 self.current_mouse_buttons.retain(|p| p != press);
+                if self.swallow_release.contains(press) {
+                    // The press was eaten by the popup menu
+                    self.swallow_release.retain(|p| p != press);
+                    return;
+                }
                 if press == &MousePress::Left && self.window_drag_position.take().is_some() {
                     // Completed a window drag
                     return;
@@ -141,6 +146,8 @@ impl super::TermWindow {
 
             WMEK::Press(ref press) => {
                 capture_mouse = true;
+                // A stale entry: the release for an earlier press never came
+                self.swallow_release.retain(|p| p != press);
 
                 // Perform click counting
                 let button = mouse_press_to_tmb(press);
@@ -279,6 +286,16 @@ impl super::TermWindow {
         let streak = self.last_mouse_click.as_ref().map_or(0, |c| c.streak);
         let consumed = menu.window_mouse_event(event, hit, over_link, streak, self);
         if consumed {
+            if let WMEK::Press(press) = &event.kind {
+                if !self.swallow_release.contains(press) {
+                    self.swallow_release.push(*press);
+                }
+                // The press belongs to the menu: moving with the button held
+                // must not drag in the terminal, and the next click there
+                // must not count as a double click
+                self.current_mouse_buttons.retain(|p| p != press);
+                self.last_mouse_click = None;
+            }
             context.set_cursor(Some(CursorIcon::Default));
         }
         consumed
