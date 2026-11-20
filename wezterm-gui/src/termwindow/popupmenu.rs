@@ -12,7 +12,9 @@ use crate::termwindow::render::corners::{
     BOTTOM_LEFT_ROUNDED_CORNER, BOTTOM_RIGHT_ROUNDED_CORNER, TOP_LEFT_ROUNDED_CORNER,
     TOP_RIGHT_ROUNDED_CORNER,
 };
-use crate::termwindow::{DimensionContext, GuiWin, TermWindow, UIItem, UIItemType};
+use crate::termwindow::{
+    DimensionContext, GuiWin, TermWindow, TermWindowNotif, UIItem, UIItemType,
+};
 use crate::utilsprites::RenderMetrics;
 use ::window::{
     MouseEvent as WindowMouseEvent, MouseEventKind as WMEK, MousePress, RectF, WindowOps,
@@ -68,8 +70,10 @@ impl StatusLinkAnchor {
 /// Pictures larger than this are not shown
 const MAX_IMAGE_BYTES: u64 = 16 * 1024 * 1024;
 /// How often the menu is laid out again while waiting for a picture
-/// (every 50 ms, so about 2 s)
-const MAX_PENDING_TRIES: u32 = 40;
+const PENDING_RETRY: Duration = Duration::from_millis(50);
+/// How long the menu waits for its pictures; after that, it is laid out
+/// without the ones that are still missing
+const PENDING_LIMIT: Duration = Duration::from_secs(2);
 /// Default height of a picture, in lines
 const IMAGE_LINES: f32 = 4.;
 
@@ -494,10 +498,13 @@ pub struct PopupMenuModal {
     selected: RefCell<Option<usize>>,
     top: RefCell<usize>,
     element: RefCell<Option<Vec<ComputedElement>>>,
-    /// A layout with a picture that is still being decoded: painted once,
-    /// then computed again
+    /// A layout with a picture that is still being decoded. Paints reuse
+    /// it until the retry timer asks for a new one.
     pending: RefCell<Option<Vec<ComputedElement>>>,
-    pending_tries: Cell<u32>,
+    /// When the menu started to wait for its pictures
+    pending_since: Cell<Option<Instant>>,
+    /// A retry timer is running
+    retry_armed: Cell<bool>,
     /// The natural width of the last layout and what it depends on. The
     /// highlight does not change it, so moving over the items reuses it
     /// instead of laying the menu out twice.
@@ -558,7 +565,8 @@ impl PopupMenuModal {
             top: RefCell::new(0),
             element: RefCell::new(None),
             pending: RefCell::new(None),
-            pending_tries: Cell::new(0),
+            pending_since: Cell::new(None),
+            retry_armed: Cell::new(false),
             natural_width: Cell::new(None),
         })
     }
@@ -1146,20 +1154,40 @@ impl Modal for PopupMenuModal {
         term_window: &mut TermWindow,
     ) -> anyhow::Result<Ref<'_, [ComputedElement]>> {
         if self.element.borrow().is_none() {
+            // Paints caused by something else (terminal output, a spinner)
+            // reuse the layout that waits for a picture; only the retry
+            // timer below asks for a new one
+            if self.pending.borrow().is_some() {
+                return Ok(Ref::map(self.pending.borrow(), |v| {
+                    v.as_ref().unwrap().as_slice()
+                }));
+            }
             let element = self.compute(term_window)?;
-            let tries = self.pending_tries.get();
-            // A picture that is never decoded must not repaint the window forever
-            if tries < MAX_PENDING_TRIES && element.iter().any(|e| e.has_pending_image()) {
-                self.pending_tries.set(tries + 1);
-                // Lay out again once the picture is decoded
-                if let Some(window) = term_window.window.clone() {
-                    promise::spawn::spawn(async move {
-                        smol::Timer::after(Duration::from_millis(50)).await;
-                        window.invalidate();
-                    })
-                    .detach();
+            let now = Instant::now();
+            let since = self.pending_since.get().unwrap_or(now);
+            // Limited by time, not by the number of paints: a picture that
+            // is never decoded must not keep the menu waiting forever
+            if element.iter().any(|e| e.has_pending_image())
+                && now.saturating_duration_since(since) < PENDING_LIMIT
+            {
+                self.pending_since.set(Some(since));
+                if !self.retry_armed.replace(true) {
+                    if let Some(window) = term_window.window.clone() {
+                        promise::spawn::spawn(async move {
+                            smol::Timer::after(PENDING_RETRY).await;
+                            window.notify(TermWindowNotif::Apply(Box::new(|term_window| {
+                                if let Some(modal) = term_window.get_modal() {
+                                    if let Some(menu) = modal.downcast_ref::<PopupMenuModal>() {
+                                        menu.retry_armed.set(false);
+                                    }
+                                }
+                                // Drops the waiting layout and repaints
+                                term_window.invalidate_modal();
+                            })));
+                        })
+                        .detach();
+                    }
                 }
-                // Painted once, but not kept: the next paint computes it again
                 *self.pending.borrow_mut() = Some(element);
                 return Ok(Ref::map(self.pending.borrow(), |v| {
                     v.as_ref().unwrap().as_slice()
@@ -1174,6 +1202,7 @@ impl Modal for PopupMenuModal {
 
     fn reconfigure(&self, _term_window: &mut TermWindow) {
         self.element.borrow_mut().take();
+        self.pending.borrow_mut().take();
     }
 }
 
