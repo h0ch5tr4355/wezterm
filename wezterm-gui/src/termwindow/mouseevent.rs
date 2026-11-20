@@ -228,7 +228,19 @@ impl super::TermWindow {
         };
 
         if self.popup_menu_mouse_event(&event, ui_item.as_ref(), context) {
-            if prior_ui_item != ui_item {
+            // The menu highlights its items itself; rebuilding the tab bar
+            // (and running the title formatting) is only needed when the
+            // hover state of the tab bar changes
+            let in_tab_bar = |item: &Option<UIItem>| {
+                matches!(
+                    item,
+                    Some(UIItem {
+                        item_type: UIItemType::TabBar(_),
+                        ..
+                    })
+                )
+            };
+            if prior_ui_item != ui_item && (in_tab_bar(&prior_ui_item) || in_tab_bar(&ui_item)) {
                 self.update_title_post_status();
             }
             return;
