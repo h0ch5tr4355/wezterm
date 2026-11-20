@@ -28,7 +28,7 @@ use std::rc::Rc;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use termwiz::cell::unicode_column_width;
-use termwiz::image::ImageData;
+use termwiz::image::{ImageData, ImageDataType};
 use wezterm_font::LoadedFont;
 use wezterm_term::{KeyCode, KeyModifiers, MouseEvent};
 use window::color::LinearRgba;
@@ -134,7 +134,12 @@ fn load_image(path: &str) -> Option<Arc<ImageData>> {
         .map_err(anyhow::Error::from)
         .and_then(|r| r.into_dimensions().map_err(anyhow::Error::from));
     match dims {
-        Ok((w, h)) if dimensions_ok(w, h) => Some(Arc::new(ImageData::with_raw_data(data))),
+        // Left encoded: the glyph cache decodes it on a background thread
+        // (see computed_element), and keeps it by hash, so opening the menu
+        // again does not decode the same picture again
+        Ok((w, h)) if dimensions_ok(w, h) => Some(Arc::new(ImageData::with_data(
+            ImageDataType::EncodedFile(data),
+        ))),
         Ok((w, h)) => {
             log::warn!("PopupMenu: skipping image {path} ({w}x{h} pixels is too large)");
             None
@@ -493,6 +498,22 @@ pub struct PopupMenuModal {
     /// then computed again
     pending: RefCell<Option<Vec<ComputedElement>>>,
     pending_tries: Cell<u32>,
+    /// The natural width of the last layout and what it depends on. The
+    /// highlight does not change it, so moving over the items reuses it
+    /// instead of laying the menu out twice.
+    natural_width: Cell<Option<(NaturalWidthKey, f32)>>,
+}
+
+/// What the natural width of the menu depends on, apart from the entries
+/// (which do not change while it is open)
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct NaturalWidthKey {
+    first: usize,
+    count: usize,
+    window_width: f32,
+    window_height: f32,
+    cell_width: f32,
+    cell_height: f32,
 }
 
 impl PopupMenuModal {
@@ -538,6 +559,7 @@ impl PopupMenuModal {
             element: RefCell::new(None),
             pending: RefCell::new(None),
             pending_tries: Cell::new(0),
+            natural_width: Cell::new(None),
         })
     }
 
@@ -1017,15 +1039,31 @@ impl PopupMenuModal {
         // Measure the natural width first, then lay out again with every row
         // as wide as the widest one so that highlights line up
         let max_width = (window_width - 2. * EDGE_GAP).max(cell_width);
-        let natural = term_window.compute_element(
-            &context(euclid::rect(0., 0., max_width, window_height)),
-            &build(None),
-        )?;
+        let key = NaturalWidthKey {
+            first,
+            count,
+            window_width,
+            window_height,
+            cell_width,
+            cell_height,
+        };
+        let natural_width = match self.natural_width.get() {
+            Some((cached, width)) if cached == key => width,
+            _ => {
+                let natural = term_window.compute_element(
+                    &context(euclid::rect(0., 0., max_width, window_height)),
+                    &build(None),
+                )?;
+                let width = natural.bounds.width();
+                self.natural_width.set(Some((key, width)));
+                width
+            }
+        };
         let min_width = self
             .args
             .min_width
             .map_or(0., |cols| cols as f32 * cell_width);
-        let width = natural.bounds.width().max(min_width).min(max_width);
+        let width = natural_width.max(min_width).min(max_width);
         // frame: 2 x (1px border + 1px padding) outside, inner border and padding,
         // item border and padding
         let row_width =
