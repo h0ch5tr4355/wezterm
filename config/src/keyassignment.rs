@@ -574,6 +574,10 @@ pub struct PopupMenuEntry {
     /// Background of the badge; its text uses the menu background color
     #[dynamic(default)]
     pub badge_color: Option<RgbaColor>,
+    /// A shortcut such as "Ctrl+Shift+T", drawn as one key cap per key.
+    /// The shortcuts of all rows start in the same column.
+    #[dynamic(default)]
+    pub keys: Option<String>,
     /// Shows a bar after the label, filled to this fraction (0.0 to 1.0)
     #[dynamic(default)]
     pub progress: Option<f32>,
