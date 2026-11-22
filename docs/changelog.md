@@ -83,7 +83,11 @@ As features stabilize some brief notes about them will accumulate here.
   [window:set_right_status](config/lua/window/set_right_status.md#clickable-parts).
 * [PopupMenu](config/lua/keyassignment/PopupMenu.md) shows a drop-down menu
   drawn by the GUI, underneath the clicked status part, with headers,
-  separators, icons, badges, progress bars and pictures.
+  separators, icons, badges, shortcuts as key caps, progress bars and
+  pictures.
+* [window:get_viewport_top_for_pane](config/lua/window/get_viewport_top_for_pane.md)
+  tells where a pane is scrolled back to, so that the visible text can be
+  read with [pane:get_text_from_region](config/lua/pane/get_text_from_region.md).
 * [command_palette_line_height](config/lua/config/command_palette_line_height.md)
   option to scale the vertical spacing of rows in the command palette,
   independently of [line_height](config/lua/config/line_height.md) which is for terminal cells only.

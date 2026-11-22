@@ -32,6 +32,8 @@ the status bar while a menu is open switches to that part's menu.
     * `icon` - text in a narrow column ahead of the label, for example a
       glyph from [wezterm.nerdfonts](../wezterm/nerdfonts.md)
     * `badge` - short text in a rounded box after the label, such as `"PROD"`
+    * `keys` - a shortcut such as `"Ctrl+Shift+T"`, drawn as one key cap per
+      key (split at `+`). The shortcuts of all rows start in the same column
     * `progress` - a number from `0.0` to `1.0`; shows a bar filled to that
       fraction. The bars of all rows line up
     * `image` - the path of a picture (PNG, JPEG, GIF, ...). The row becomes
@@ -75,7 +77,7 @@ config.keys = {
         { label = 'Context', detail = 'staging', id = 'copy' },
         { label = 'Quota', progress = 0.42, detail = '42%' },
         { kind = 'Separator' },
-        { label = 'Show pods', icon = wezterm.nerdfonts.md_cube_outline, id = 'pods' },
+        { label = 'Show pods', icon = wezterm.nerdfonts.md_cube_outline, keys = 'Ctrl+Shift+P', id = 'pods' },
         { label = 'production', badge = 'PROD', badge_color = '#c4483c', id = 'prod' },
       },
       action = wezterm.action_callback(function(window, pane, id, label)

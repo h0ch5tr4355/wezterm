@@ -381,6 +381,49 @@ fn badge_element(
         })
 }
 
+/// The keys of a shortcut: "Ctrl+Shift+T" gives "Ctrl", "Shift", "T".
+/// Text that does not split cleanly (eg: "+" or "Ctrl++") stays one key.
+fn split_keys(text: &str) -> Vec<&str> {
+    let parts: Vec<&str> = text.split('+').map(str::trim).collect();
+    if parts.len() > 1 && parts.iter().all(|p| !p.is_empty()) {
+        parts
+    } else {
+        vec![text.trim()]
+    }
+}
+
+/// A shortcut as a row of key caps
+fn keys_element(font: &Rc<LoadedFont>, text: &str, enabled: bool, pal: &Palette) -> Element {
+    let cap_bg = mix(pal.bg, pal.fg, 0.1);
+    let cap_border = mix(pal.bg, pal.fg, 0.28);
+    let cap_text = if enabled { pal.fg } else { pal.dim };
+    let caps = split_keys(text)
+        .into_iter()
+        .enumerate()
+        .map(|(i, key)| {
+            Element::new(font, ElementContent::Text(key.to_string()))
+                .margin(sides(
+                    cells(if i == 0 { 0. } else { 0.25 }),
+                    cells(0.),
+                    cells(0.),
+                    cells(0.),
+                ))
+                .padding(sides(cells(0.45), cells(0.45), cells(0.), cells(0.)))
+                .border(BoxDimension::new(Dimension::Pixels(1.)))
+                .border_corners(Some(rounded(cells(0.3))))
+                .vertical_align(VerticalAlign::Middle)
+                .colors(ElementColors {
+                    border: BorderColor::new(cap_border),
+                    bg: cap_bg.into(),
+                    text: cap_text.into(),
+                })
+        })
+        .collect();
+    Element::new(font, ElementContent::Children(caps))
+        .margin(sides(cells(1.), cells(0.), cells(0.), cells(0.)))
+        .vertical_align(VerticalAlign::Middle)
+}
+
 /// The frame of an item: padding, the rounded highlight and the hit area
 fn item_row(
     font: &Rc<LoadedFont>,
@@ -509,6 +552,9 @@ pub struct PopupMenuModal {
     /// highlight does not change it, so moving over the items reuses it
     /// instead of laying the menu out twice.
     natural_width: Cell<Option<(NaturalWidthKey, f32)>>,
+    /// Width of the widest label that is followed by `keys`, so that the
+    /// shortcuts line up, and the cell size it was measured with
+    keys_column: Cell<Option<((f32, f32), Option<f32>)>>,
 }
 
 /// What the natural width of the menu depends on, apart from the entries
@@ -568,6 +614,7 @@ impl PopupMenuModal {
             pending_since: Cell::new(None),
             retry_armed: Cell::new(false),
             natural_width: Cell::new(None),
+            keys_column: Cell::new(None),
         })
     }
 
@@ -688,7 +735,9 @@ impl PopupMenuModal {
     }
 
     /// One row of the menu. `row_width` is the content width of an item
-    /// (None while measuring the natural width).
+    /// (None while measuring the natural width). Labels followed by `keys`
+    /// are `keys_column` pixels wide.
+    #[allow(clippy::too_many_arguments)]
     fn entry_element(
         &self,
         font: &Rc<LoadedFont>,
@@ -699,6 +748,7 @@ impl PopupMenuModal {
         row_width: Option<f32>,
         cell_width: f32,
         bar_detail_cells: f32,
+        keys_column: Option<f32>,
         pal: &Palette,
     ) -> Element {
         let full = row_width.map(Dimension::Pixels);
@@ -761,12 +811,19 @@ impl PopupMenuModal {
         } else {
             font
         };
-        kids.push(
-            Element::new(label_font, ElementContent::Text(entry.label.clone()))
-                .vertical_align(VerticalAlign::Bottom)
-                .colors(plain(label_color)),
-        );
+        let mut label = Element::new(label_font, ElementContent::Text(entry.label.clone()))
+            .vertical_align(VerticalAlign::Bottom)
+            .colors(plain(label_color));
+        if entry.keys.is_some() && entry.kind == PopupMenuEntryKind::Item {
+            label = label.min_width(keys_column.map(Dimension::Pixels));
+        }
+        kids.push(label);
 
+        if entry.kind == PopupMenuEntryKind::Item {
+            if let Some(keys) = &entry.keys {
+                kids.push(keys_element(font, keys, enabled, pal));
+            }
+        }
         if let Some(badge) = &entry.badge {
             kids.push(badge_element(font, badge, entry.badge_color, pal));
         }
@@ -866,6 +923,9 @@ impl PopupMenuModal {
             Element::new(font, ElementContent::Text(entry.label.clone()))
                 .colors(plain(label_color)),
         ];
+        if let Some(keys) = &entry.keys {
+            first_line.push(keys_element(font, keys, enabled, pal));
+        }
         if let Some(badge) = &entry.badge {
             first_line.push(badge_element(font, badge, entry.badge_color, pal));
         }
@@ -982,6 +1042,29 @@ impl PopupMenuModal {
             zindex: 100,
         };
 
+        // The shortcuts start in one column: after the widest label that
+        // has one. Cards draw them on their own line and do not count.
+        let keys_column = match self.keys_column.get() {
+            Some((size, column)) if size == (cell_width, cell_height) => column,
+            _ => {
+                let mut column: Option<f32> = None;
+                for (idx, e) in entries.iter().enumerate() {
+                    if e.kind != PopupMenuEntryKind::Item || e.keys.is_none() || self.has_image(idx)
+                    {
+                        continue;
+                    }
+                    let label = term_window.compute_element(
+                        &context(euclid::rect(0., 0., window_width, window_height)),
+                        &Element::new(&font, ElementContent::Text(e.label.clone())),
+                    )?;
+                    column = Some(column.unwrap_or(0.).max(label.bounds.width()));
+                }
+                self.keys_column
+                    .set(Some(((cell_width, cell_height), column)));
+                column
+            }
+        };
+
         let arrow = |text: &str, show: bool| {
             Element::new(
                 &font,
@@ -1013,6 +1096,7 @@ impl PopupMenuModal {
                             row_width,
                             cell_width,
                             bar_detail_cells,
+                            keys_column,
                             &pal,
                         )
                     }),
@@ -1224,6 +1308,16 @@ mod test {
             id: Some("ignored".into()),
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn shortcuts_split_into_keys() {
+        assert_eq!(split_keys("Ctrl+Shift+T"), vec!["Ctrl", "Shift", "T"]);
+        assert_eq!(split_keys("Alt+Shift+-"), vec!["Alt", "Shift", "-"]);
+        assert_eq!(split_keys("Esc"), vec!["Esc"]);
+        assert_eq!(split_keys("+"), vec!["+"]);
+        assert_eq!(split_keys("Ctrl++"), vec!["Ctrl++"]);
+        assert_eq!(split_keys(" Win + Z "), vec!["Win", "Z"]);
     }
 
     #[test]

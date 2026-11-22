@@ -150,6 +150,21 @@ impl UserData for GuiWin {
                 Ok(text)
             },
         );
+        // The first row shown while the pane is scrolled back, nil when it
+        // shows the bottom of the scrollback
+        methods.add_async_method(
+            "get_viewport_top_for_pane",
+            |_, this, pane: UserDataRef<MuxPane>| async move {
+                let pane_id = pane.0;
+                let (tx, rx) = smol::channel::bounded(1);
+                this.window
+                    .notify(TermWindowNotif::Apply(Box::new(move |term_window| {
+                        tx.try_send(term_window.get_viewport(pane_id)).ok();
+                    })));
+                let top = rx.recv().await.map_err(mlua::Error::external)?;
+                Ok(top)
+            },
+        );
         methods.add_async_method("current_event", |lua, this, _: ()| async move {
             let (tx, rx) = smol::channel::bounded(1);
             this.window
