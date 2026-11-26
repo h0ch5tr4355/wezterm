@@ -1192,6 +1192,10 @@ impl PopupMenuModal {
 }
 
 impl Modal for PopupMenuModal {
+    fn captures_all_keys(&self) -> bool {
+        true
+    }
+
     fn mouse_event(&self, _event: MouseEvent, _term_window: &mut TermWindow) -> anyhow::Result<()> {
         Ok(())
     }
