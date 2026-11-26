@@ -248,6 +248,25 @@ impl super::TermWindow {
         is_down: bool,
         key_event: Option<&KeyEvent>,
     ) -> bool {
+        if let Some(modal) = self.get_modal().filter(|modal| modal.captures_all_keys()) {
+            // The raw/physical pass runs before the modal sees the key and
+            // would perform key bindings behind its back. Leave the key to
+            // the regular pass, which hands it to the modal.
+            if only_key_bindings == OnlyKeyBindings::Yes {
+                return false;
+            }
+            if is_down {
+                if let Key::Code(term_key) = self.win_key_code_to_termwiz_key_code(keycode) {
+                    if let Err(err) =
+                        modal.key_down(term_key, raw_modifiers.remove_positional_mods(), self)
+                    {
+                        log::error!("Error dispatching key to modal: {err:#}");
+                    }
+                }
+            }
+            return true;
+        }
+
         if is_down && !leader_active {
             // Check to see if this key-press is the leader activating
             if let Some(duration) = self.input_map.is_leader(&keycode, raw_modifiers) {

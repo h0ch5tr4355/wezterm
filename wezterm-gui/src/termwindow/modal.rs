@@ -25,5 +25,11 @@ pub trait Modal: Downcast {
         term_window: &mut TermWindow,
     ) -> anyhow::Result<Ref<'_, [ComputedElement]>>;
     fn reconfigure(&self, term_window: &mut TermWindow);
+    /// Whether the modal takes every key press while it is open, like a
+    /// menu of the operating system: key bindings, the leader key and the
+    /// raw/physical key matching are not consulted.
+    fn captures_all_keys(&self) -> bool {
+        false
+    }
 }
 impl_downcast!(Modal);
